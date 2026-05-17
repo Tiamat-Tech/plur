@@ -20,15 +20,23 @@ const MAX_REMOTE_RESPONSE_BYTES = 128 * 1024  // 128 KB
 // round trips, short enough to be invisible when the network is fine.
 const REMOTE_TIMEOUT_MS = 1500
 
-// Failure-log path. tryRemoteInject is fail-open by design (it MUST
+// Failure-log dir. tryRemoteInject is fail-open by design (it MUST
 // never block the user's prompt) — but silent fail-open is unfalsifiable
 // (Taleb #2): you cannot distinguish "Enterprise is working but had no
 // engrams for this query" from "Enterprise is unreachable and we
-// silently degraded to local." This log writes ONE LINE per remote
-// attempt so the operator can `tail -f` it or `plur doctor` summarises
-// it. Rotated by size at 256KB.
-const REMOTE_INJECT_LOG_PATH = join(homedir(), '.plur', 'remote-inject.log')
-const REMOTE_INJECT_LOG_MAX_BYTES = 256 * 1024
+// silently degraded to local." Each remote attempt writes ONE JSON LINE.
+//
+// File-per-day rotation avoids the truncation race the earlier size-
+// based scheme had (dijkstra DEF-1): two concurrent hooks could both
+// observe "over cap" and both truncate, the second wiping the first's
+// entry. POSIX guarantees that appendFileSync (O_APPEND) writes smaller
+// than PIPE_BUF (4KB on Linux) are atomic, so concurrent appends to
+// the same day-file are safe. Cleanup of old day-files is a follow-up
+// (plur doctor can list/prune them).
+const REMOTE_INJECT_LOG_DIR = join(homedir(), '.plur', 'logs')
+function remoteInjectLogPath(): string {
+  return join(REMOTE_INJECT_LOG_DIR, `remote-inject-${new Date().toISOString().slice(0, 10)}.jsonl`)
+}
 
 function logRemoteAttempt(entry: {
   ts:        string
@@ -40,20 +48,11 @@ function logRemoteAttempt(entry: {
   detail?:   string
 }): void {
   try {
-    mkdirSync(dirname(REMOTE_INJECT_LOG_PATH), { recursive: true })
-    // Crude rotation: if the file is over the cap, truncate by overwriting
-    // with just this entry. Lossy but simple — full audit lives server-side.
-    let openMode: 'append' | 'truncate' = 'append'
-    if (existsSync(REMOTE_INJECT_LOG_PATH)) {
-      try {
-        if (statSync(REMOTE_INJECT_LOG_PATH).size > REMOTE_INJECT_LOG_MAX_BYTES) {
-          openMode = 'truncate'
-        }
-      } catch { /* stat failed → keep appending */ }
-    }
-    const line = JSON.stringify(entry) + '\n'
-    if (openMode === 'truncate') writeFileSync(REMOTE_INJECT_LOG_PATH, line)
-    else                          appendFileSync(REMOTE_INJECT_LOG_PATH, line)
+    mkdirSync(REMOTE_INJECT_LOG_DIR, { recursive: true })
+    // O_APPEND under POSIX guarantees atomic writes < PIPE_BUF.
+    // The serialized entry is well under that, so concurrent hooks
+    // never tear each other's lines or wipe history.
+    appendFileSync(remoteInjectLogPath(), JSON.stringify(entry) + '\n')
   } catch {
     // Log write failed — accept silently. The hook MUST never throw.
   }
